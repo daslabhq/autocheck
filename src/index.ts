@@ -17,5 +17,5 @@
  */
 
 export type { CheckResult, CheckMeta, AnchorRef, Reference } from "./check.js";
-export { runCheck, isGapable, CelError } from "./cel.js";
+export { runCheck, isGapable, validateCel, CelError } from "./cel.js";
 export { resolve, lookup } from "./path.js";

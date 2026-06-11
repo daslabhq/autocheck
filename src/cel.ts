@@ -244,6 +244,30 @@ export function isGapable(cel: string): boolean {
   try { runCheck({}, cel); return true; } catch (e) { return !(e instanceof CelError); }
 }
 
+/**
+ * Validate a CEL predicate WITHOUT real data — for checking a criterion at
+ * authoring time. Catches syntax errors AND unsupported-subset constructs
+ * (e.g. method chaining like `assets.filter(...).exists(...)`, which the gap
+ * evaluator rejects with "expected a field path, got method") before the
+ * criterion is persisted, so the author fixes the rule instead of it silently
+ * grading 0 forever. Missing-data references are NOT errors — they grade as a
+ * gap at runtime. Returns `{ ok }` on success, `{ ok: false, error }` otherwise.
+ */
+export function validateCel(cel: string): { ok: boolean; error?: string } {
+  if (typeof cel !== "string" || cel.trim() === "") {
+    return { ok: false, error: "empty CEL expression" };
+  }
+  try {
+    // A representative-but-empty tree: the collections/scalars criteria
+    // reference exist (so structural errors surface) but hold no data (so
+    // missing-field lookups don't masquerade as errors).
+    runCheck({ assets: [], spend_usd: 0, spend_tokens: 0, recent_jobs: [] }, cel);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 // ── tiny helpers ────────────────────────────────────────────────────────────
 function deepEq(a: unknown, b: unknown): boolean {
   if (a === b) return true;
