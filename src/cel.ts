@@ -19,6 +19,8 @@
  *   notes.exists(n, n.len >= 40)                      any-match (min sub-gap)
  *   notes.all(n, n.has_content)                       all-match (gap = #violations)
  *   a && b   /   a || b   /   !a                      compose
+ *   headers["content-type"].contains("json")          index — non-identifier keys
+ *   rows[0].amount                                    index — array position
  *
  * Anything outside this (arithmetic, string building, joins) has no defined gap
  * — it throws CelError, and the caller routes that criterion to the LLM judge.
@@ -34,7 +36,7 @@ export class CelError extends Error {
 // ── Tokenizer ──────────────────────────────────────────────────────────────
 type Tok = { t: "id" | "num" | "str" | "op" | "punc"; v: string };
 const OPS2 = ["==", "!=", "<=", ">=", "&&", "||"];
-const OPS1 = "<>!.(),";
+const OPS1 = "<>!.(),[]";
 
 function lex(src: string): Tok[] {
   const toks: Tok[] = [];
@@ -63,7 +65,7 @@ function lex(src: string): Tok[] {
     }
     const two = src.slice(i, i + 2);
     if (OPS2.includes(two)) { toks.push({ t: "op", v: two }); i += 2; continue; }
-    if (OPS1.includes(c)) { toks.push({ t: c === "(" || c === ")" || c === "," ? "punc" : "op", v: c }); i++; continue; }
+    if (OPS1.includes(c)) { toks.push({ t: "()[],".includes(c) ? "punc" : "op", v: c }); i++; continue; }
     throw new CelError(`unexpected character '${c}'`);
   }
   return toks;
@@ -74,6 +76,7 @@ type Node =
   | { k: "id"; name: string }
   | { k: "lit"; value: string | number | boolean }
   | { k: "member"; obj: Node; prop: string }
+  | { k: "index"; obj: Node; key: string | number }
   | { k: "call"; fn: string; args: Node[] }
   | { k: "method"; recv: Node; name: string; args: Node[] }
   | { k: "unary"; op: string; arg: Node }
@@ -102,12 +105,32 @@ class Parser {
         if (name?.t !== "id") throw new CelError("expected member name after '.'");
         if (this.peek()?.v === "(") n = { k: "method", recv: n, name: name.v, args: this.args() };
         else n = { k: "member", obj: n, prop: name.v };
+      } else if (this.peek()?.v === "[") {
+        n = this.indexOn(n);
       } else break;
     }
     return n;
   }
+  /**
+   * `obj["key"]` / `obj[0]` — the way to reach a key that isn't a bare
+   * identifier. JSON keys are arbitrary strings; `a.b` only covers the subset
+   * that happens to lex as one. Without this, `content-type`, `$ref`, `@type`
+   * and every kebab-case key are unreachable — the tokenizer stops at the '-'.
+   */
+  private indexOn(obj: Node): Node {
+    this.eat("[");
+    const key = this.next();
+    if (key?.t !== "str" && key?.t !== "num") {
+      throw new CelError('index must be a quoted key or a number, e.g. x["my-key"] or rows[0]');
+    }
+    this.eat("]");
+    return { k: "index", obj, key: key.t === "num" ? Number(key.v) : key.v };
+  }
   private args(): Node[] { this.eat("("); const a: Node[] = []; if (this.peek()?.v !== ")") { a.push(this.or()); while (this.peek()?.v === ",") { this.next(); a.push(this.or()); } } this.eat(")"); return a; }
   private primary(): Node {
+    // A leading `["key"]` indexes the root object, which is how a top-level
+    // key that isn't an identifier gets reached at all.
+    if (this.peek()?.v === "[") return this.indexOn({ k: "id", name: "" });
     const t = this.next();
     if (!t) throw new CelError("unexpected EOF");
     if (t.v === "(") { const n = this.or(); this.eat(")"); return n; }
@@ -130,7 +153,25 @@ class Parser {
 function pathOf(n: Node, bound?: string): string {
   if (n.k === "id") return bound && n.name === bound ? "" : n.name;
   if (n.k === "member") { const base = pathOf(n.obj, bound); return base ? `${base}.${n.prop}` : n.prop; }
+  if (n.k === "index") return indexPath(n, bound);
   throw new CelError(`expected a field path, got ${n.k}`);
+}
+
+/**
+ * Render an index into the path syntax path.ts already parses: `rows[0]` for a
+ * position, plain dot-joining for a string key (its segment pattern is
+ * `[^.[\]]+`, so hyphens and most punctuation pass through untouched).
+ *
+ * A key containing `.`, `[` or `]` cannot survive that round-trip, so say so
+ * rather than silently resolving the wrong path.
+ */
+function indexPath(n: Extract<Node, { k: "index" }>, bound?: string): string {
+  const base = pathOf(n.obj, bound);
+  if (typeof n.key === "number") return `${base}[${n.key}]`;
+  if (/[.[\]]/.test(n.key)) {
+    throw new CelError(`index key "${n.key}" contains '.', '[' or ']', which the path syntax cannot express`);
+  }
+  return base ? `${base}.${n.key}` : n.key;
 }
 function litOf(n: Node): string | number | boolean { if (n.k !== "lit") throw new CelError("expected a literal value"); return n.value; }
 function val(scene: unknown, n: Node, bound?: string): unknown { return n.k === "lit" ? n.value : resolve(scene, pathOf(n, bound)); }
@@ -224,6 +265,7 @@ function evalGap(scene: unknown, n: Node, bound?: string): CheckResult {
       throw new CelError(`unsupported method '.${n.name}()' (or it needs a comparison, e.g. .size() >= 3)`);
     }
     case "member":
+    case "index":
     case "id": {
       // bare boolean field, e.g. note.has_content
       const path = pathOf(n, bound); const v = resolve(scene, path);
